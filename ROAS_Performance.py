@@ -7,6 +7,17 @@ from matplotlib.ticker import PercentFormatter
 # Set Streamlit page configuration.
 st.set_page_config(layout="wide")
 
+# Custom CSS for making the tabs prominent
+st.markdown("""
+<style>
+.stTabs [data-testid="stTab"] button {
+    font-size: 1.25rem;
+    font-weight: bold;
+}
+</style>
+""", unsafe_allow_html=True)
+
+
 # A function to load and preprocess data from the uploaded file.
 @st.cache_data
 def load_data(uploaded_file):
@@ -38,10 +49,10 @@ if 'df' not in st.session_state:
     st.session_state.roas_days = None
     st.session_state.uploaded_filename = None
 
-# Logic to automatically switch to analysis page if data is already in session state
-if not st.session_state.show_analysis_page and st.session_state.df is not None:
+# Logic to handle page transitions and file persistence
+# If a file is already loaded, go directly to the analysis page
+if st.session_state.df is not None:
     st.session_state.show_analysis_page = True
-    st.rerun()
 
 if not st.session_state.show_analysis_page:
     # This is the intro page with the file uploader.
@@ -51,7 +62,7 @@ if not st.session_state.show_analysis_page:
     
     st.markdown("---")
 
-    # The new link to download the report file, with app_token removed
+    # The link to download the report file, with app_token removed
     report_link = "https://suite.adjust.com/datascape/report?utc_offset=%2B00%3A00&reattributed=all&attribution_source=first&attribution_type=all&ad_spend_mode=network&date_period=-92d%3A-1d&cohort_maturity=mature&sandbox=false&channel_id__in=%22partner_257%22%2C%22partner_7%22%2C%22partner_34%22%2C%22partner_182%22%2C%22partner_100%22%2C%22partner_369%22%2C%22partner_56%22%2C%22partner_490%22%2C%22partner_2337%2C1678%22%2C%22partner_217%22&applovin_mode=probabilistic&ironsource_mode=ironsource&dimensions=app%2Cchannel%2Ccampaign_network&format_dates=false&full_data=true&include_attr_dependency=true&metrics=cost%2Cinstalls%2Cgross_profit%2Croas_d0%2Croas_d3%2Croas_d7%2Croas_d14%2Croas_d21%2Croas_d28%2Croas_d30%2Croas_d45%2Croas_d50&readable_names=false&sort=-cost&parent_report_id=213219&cost__gt__column=0&is_report_setup_open=true&table_view=pivot"
     st.markdown(f"**Don't have the report file?** You can download it directly from here: [**Adjust Report Link**]({report_link})")
     
@@ -159,8 +170,29 @@ else:
             if selected_campaigns:
                 st.subheader("Campaign Performance Tables")
 
-                # Table 1: Cumulative ROAS Growth from D0
-                st.write("**1. Cumulative ROAS Growth from D0**")
+                # Table 1: Actual ROAS values with heatmap (reordered to be first)
+                st.write("**1. Actual ROAS Values**")
+                
+                actual_roas_data = []
+                for campaign_name in selected_campaigns:
+                    campaign_df = app_df[app_df['campaign_network'] == campaign_name]
+                    campaign_roas = campaign_df[roas_columns_filtered].mean(numeric_only=True)
+                    
+                    actual_roas_row = {'Campaign': campaign_name}
+                    for col in roas_columns_filtered:
+                         actual_roas_row[f'ROAS {col.replace("roas_d", "D").upper()}'] = campaign_roas[col]
+                    actual_roas_data.append(actual_roas_row)
+
+                if actual_roas_data:
+                    actual_roas_df = pd.DataFrame(actual_roas_data).set_index('Campaign')
+                    styled_actual_roas_df = actual_roas_df.style.background_gradient(cmap='YlGnBu', axis=1).format(lambda x: f'{x*100:.2f}%' if isinstance(x, (float, np.float64)) else x)
+                    st.dataframe(styled_actual_roas_df, use_container_width=True)
+                else:
+                    st.info("No data available to show actual ROAS for selected campaigns.")
+                
+                # Table 2: Cumulative ROAS Growth from D0 (reordered to be second)
+                st.markdown("---")
+                st.write("**2. Cumulative ROAS Growth from D0**")
                 growth_data = []
                 roas_cols_for_growth = [col for col in roas_columns_filtered if col != 'roas_d0']
                 
@@ -183,9 +215,9 @@ else:
                 else:
                     st.info("No data available to calculate growth for selected campaigns.")
                 
-                # Table 2: Day-over-Day ROAS Growth
+                # Table 3: Day-over-Day ROAS Growth (reordered to be third)
                 st.markdown("---")
-                st.write("**2. Day-over-Day ROAS Growth**")
+                st.write("**3. Day-over-Day ROAS Growth**")
                 
                 day_over_day_growth_data = []
                 intervals = roas_columns_filtered
@@ -218,28 +250,6 @@ else:
                     st.dataframe(styled_d_o_d_growth_df, use_container_width=True)
                 else:
                     st.info("No data available to calculate day-over-day growth for selected campaigns.")
-
-
-                # Table 3: Actual ROAS values with heatmap
-                st.markdown("---")
-                st.write("**3. Actual ROAS Values**")
-                
-                actual_roas_data = []
-                for campaign_name in selected_campaigns:
-                    campaign_df = app_df[app_df['campaign_network'] == campaign_name]
-                    campaign_roas = campaign_df[roas_columns_filtered].mean(numeric_only=True)
-                    
-                    actual_roas_row = {'Campaign': campaign_name}
-                    for col in roas_columns_filtered:
-                         actual_roas_row[f'ROAS {col.replace("roas_d", "D").upper()}'] = campaign_roas[col]
-                    actual_roas_data.append(actual_roas_row)
-
-                if actual_roas_data:
-                    actual_roas_df = pd.DataFrame(actual_roas_data).set_index('Campaign')
-                    styled_actual_roas_df = actual_roas_df.style.background_gradient(cmap='YlGnBu', axis=1).format(lambda x: f'{x*100:.2f}%' if isinstance(x, (float, np.float64)) else x)
-                    st.dataframe(styled_actual_roas_df, use_container_width=True)
-                else:
-                    st.info("No data available to show actual ROAS for selected campaigns.")
 
 
                 # Individual Campaign Break-Even Analysis section
