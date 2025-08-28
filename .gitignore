@@ -1,0 +1,10 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Local data files (don’t upload user data to GitHub)
+data_cache/
+
+# OS specific
+.DS_Store
+Thumbs.db
