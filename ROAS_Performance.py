@@ -24,17 +24,15 @@ st.markdown("""
 # Utilities: per-user "sid" via URL (using st.query_params only)
 # -----------------------------
 def get_or_set_sid():
-    """
-    If ?sid is in the URL, use it. Otherwise create a new sid and set it in the URL query params.
-    Keeps the same sid across hard refresh and isolates users unless they share the sid link.
-    """
+
    # st.query_params behaves like a dict
-  bs = BrowserStorage(key="roas_analyzer_user_id")   # localStorage key
-    sid = bs.get("sid")                                # read if exists
-    if not sid:
-        sid = str(uuid.uuid4())
-        bs.set("sid", sid)                             # persist to browser
-    return sid                               
+  bs = BrowserStorage(key="roas_analyzer_user_id")
+   # localStorage key
+  sid = bs.get("sid")                                # read if exists
+  if not sid:
+      sid = str(uuid.uuid4())
+      bs.set("sid", sid)                             # persist to browser
+  return sid                               
 
 SID = get_or_set_sid()
 
