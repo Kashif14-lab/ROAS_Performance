@@ -27,20 +27,14 @@ def get_or_set_sid():
     If ?sid is in the URL, use it. Otherwise create a new sid and set it in the URL query params.
     Keeps the same sid across hard refresh and isolates users unless they share the sid link.
     """
-    # st.query_params behaves like a dict
+   # st.query_params behaves like a dict
     if "sid" in st.query_params and st.query_params["sid"]:
-        return st.query_params["sid"]
-    sid = str(uuid.uuid4())
-    st.query_params["sid"] = sid  # updates the URL
-    return sid
+        return st.query_params["sid"][0]  # first value if multiple
+    sid = str(uuid.uuid4())          # new sid
+    st.query_params["sid"] = sid  # puts sid in the URL
+    return sid                                
 
 SID = get_or_set_sid()
-
-# Optional: Session tools
-with st.sidebar.expander("Session controls", expanded=False):
-    if st.button("Reset my session (new private link)"):
-        st.query_params["sid"] = str(uuid.uuid4())
-        st.rerun()
 
 # -----------------------------
 # Per-sid cache path helpers
@@ -604,3 +598,4 @@ else:
                     st.warning("D0 ROAS is zero/NaN — cannot compute scenario growth.")
         else:
             st.info("Please select one or more campaigns to analyze.")
+
