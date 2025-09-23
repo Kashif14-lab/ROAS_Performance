@@ -8,7 +8,6 @@ import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 from matplotlib.ticker import PercentFormatter
-from streamlit_browser_storage import BrowserStorage
 
 # -----------------------------
 # Page config + light styling
@@ -24,15 +23,12 @@ st.markdown("""
 # Utilities: per-user "sid" via URL (using st.query_params only)
 # -----------------------------
 def get_or_set_sid():
-
-   # st.query_params behaves like a dict
-  bs = BrowserStorage(key="roas_analyzer_user_id")
-   # localStorage key
-  sid = bs.get("sid")                                # read if exists
-  if not sid:
-      sid = str(uuid.uuid4())
-      bs.set("sid", sid)                             # persist to browser
-  return sid                               
+    # Use URL query param only (no extra deps)
+    if "sid" in st.query_params and st.query_params["sid"]:
+        return st.query_params["sid"]
+    sid = str(uuid.uuid4())
+    st.query_params["sid"] = sid   # sets sid in URL
+    return sid
 
 SID = get_or_set_sid()
 
@@ -598,5 +594,6 @@ else:
                     st.warning("D0 ROAS is zero/NaN — cannot compute scenario growth.")
         else:
             st.info("Please select one or more campaigns to analyze.")
+
 
 
