@@ -22,12 +22,29 @@ st.markdown("""
 # -----------------------------
 # Utilities: per-user "sid" via URL (using st.query_params only)
 # -----------------------------
+try:
+    from streamlit_browser_storage import BrowserStorage
+    _HAS_BS = True
+except Exception:
+    _HAS_BS = False
+
 def get_or_set_sid():
-    # Use URL query param only (no extra deps)
+    if _HAS_BS:
+        try:
+            bs = BrowserStorage(key="roas_analyzer_user_id")
+            sid = bs.get("sid")
+            if not sid:
+                sid = str(uuid.uuid4())
+                bs.set("sid", sid)
+            return sid
+        except Exception:
+            pass  # fall through to query_params if plugin misbehaves
+
+    # Fallback: URL query param (no extra deps)
     if "sid" in st.query_params and st.query_params["sid"]:
         return st.query_params["sid"]
     sid = str(uuid.uuid4())
-    st.query_params["sid"] = sid   # sets sid in URL
+    st.query_params["sid"] = sid
     return sid
 
 SID = get_or_set_sid()
@@ -594,6 +611,7 @@ else:
                     st.warning("D0 ROAS is zero/NaN — cannot compute scenario growth.")
         else:
             st.info("Please select one or more campaigns to analyze.")
+
 
 
 
