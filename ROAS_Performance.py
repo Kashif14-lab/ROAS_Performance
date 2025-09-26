@@ -229,7 +229,7 @@ if not st.session_state.show_analysis_page:
     st.write("Upload an Adjust CSV to analyze ROAS simply and persist it to your private session.")
 
     st.markdown("---")
-    report_link = "https://suite.adjust.com/datascape/report?utc_offset=%2B00%3A00&reattributed=all&attribution_source=first&attribution_type=all&ad_spend_mode=network&date_period=-92d%3A-1d&cohort_maturity=mature&sandbox=false&channel_id__in=%22partner_257%22%2C%22partner_7%22%2C%22partner_34%22%2C%22partner_182%22%2C%22partner_100%22%2C%22partner_369%22%2C%22partner_56%22%2C%22partner_490%22%2C%22partner_2337%2C1678%22%2C%22partner_217%22&applovin_mode=probabilistic&ironsource_mode=ironsource&dimensions=app%2Cchannel%2Ccampaign_network&format_dates=false&full_data=true&include_attr_dependency=true&metrics=cost%2Cinstalls%2Cgross_profit%2Croas_d0%2Croas_d3%2Croas_d7%2Croas_d14%2Croas_d21%2Croas_d28%2Croas_d30%2Croas_d45%2Croas_d50&readable_names=false&sort=-cost&parent_report_id=213219&cost__gt__column=0&is_report_setup_open=true&table_view=pivot"
+    report_link = "https://suite.adjust.com/datascape/report?utc_offset=%2B00%3A00&reattributed=all&attribution_source=first&ad_spend_mode=network&date_period=-92d%3A-1d&cohort_maturity=mature&sandbox=false&channel_id__in=%22partner_257%22%2C%22partner_7%22%2C%22partner_34%22%2C%22partner_182%22%2C%22partner_100%22%2C%22partner_369%22%2C%22partner_56%22%2C%22partner_490%22%2C%22partner_2337%2C1678%22%2C%22partner_217%22&applovin_mode=probabilistic&ironsource_mode=ironsource&dimensions=app%2Cchannel%2Ccampaign_network&format_dates=false&full_data=true&include_attr_dependency=true&metrics=cost%2Cinstalls%2Cgross_profit%2Croas_d0%2Croas_d3%2Croas_d7%2Croas_d14%2Croas_d21%2Croas_d28%2Croas_d30%2Croas_d45%2Croas_d50%2Croas_d60%2Croas_d75&readable_names=false&sort=-cost&parent_report_id=213219&cost__gt__column=0&is_report_setup_open=true&table_view=pivot"
     st.markdown(f"**Need the report?** Download here: [**Adjust Report Link**]({report_link})")
 
     uploaded_file = st.file_uploader("Upload CSV:", type=["csv"], key="uploader")
@@ -453,7 +453,7 @@ else:
                 st.info("Baseline curve could not be computed (D0 missing or zero).")
             else:
                 # Adjust targets as per your data (Adjust often has up to D50)
-                target_days = [30, 45, 50, 60]
+                target_days = [30, 45, 50, 60, 75]
                 proj = _project_from_d0(proj_d0, curve, target_days)
 
                 st.write("**Projected ROAS (given your D0 and historical growth):**")
@@ -709,3 +709,4 @@ else:
                     st.warning("D0 ROAS is zero/NaN — cannot compute scenario growth.")
         else:
             st.info("Please select one or more campaigns to analyze.")
+
