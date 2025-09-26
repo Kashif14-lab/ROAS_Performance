@@ -470,6 +470,15 @@ else:
                       .style.format({"Projected ROAS": lambda x: f"{x*100:.2f}%" if pd.notna(x) else "—"}),
                     use_container_width=True
                 )
+        with st.expander("Debug: projection inputs", expanded=False):
+            st.write("Detected ROAS columns:", roas_columns_filtered)
+            if baseline_series is not None and not baseline_series.empty:
+                st.write("Baseline series (raw averages/median):")
+                st.dataframe(baseline_series.to_frame("value").style.format("{:.4f}"))
+                st.write("Growth multipliers vs D0:")
+                st.dataframe(_growth_curve(baseline_series).to_frame("mult").style.format("{:.4f}"))
+            else:
+                st.write("No baseline series (empty).")
         # ======== /Quick Projection from D0 ========
 
         if selected_campaigns:
@@ -709,4 +718,5 @@ else:
                     st.warning("D0 ROAS is zero/NaN — cannot compute scenario growth.")
         else:
             st.info("Please select one or more campaigns to analyze.")
+
 
