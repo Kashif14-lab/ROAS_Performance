@@ -429,56 +429,102 @@ else:
             ("Selected campaign (avg of selected)", "Network-level median (this game + network)"),
             horizontal=True
         )
+        def _median_multiplier_curve(df_block: pd.DataFrame, roas_cols: list[str]) -> pd.Series:
+            """
+            Per-row multipliers: (ROAS_d / ROAS_d0), then median across rows for each day.
+            Ensures roas_d0 == 1.0. Cleans NaNs and enforces monotonic non-decreasing.
+            """
+            if df_block.empty:
+                return pd.Series(dtype=float)
+            if "roas_d0" not in [c.lower() for c in roas_cols]:
+                return pd.Series(dtype=float)
+            
+        # align columns case-insensitively
+        col_map = {c.lower(): c for c in roas_cols}
+        d0col = col_map["roas_d0"]
 
-        baseline_series = None
+        # avoid /0
+        d0_series = df_block[d0col].replace(0, np.nan)
+
+        # per-row ratios
+        ratios = pd.DataFrame(index=df_block.index)
+        for c in roas_cols:
+            ratios[c] = df_block[c] / d0_series
+        # median multiplier per day
+        med = ratios.median(axis=0, numeric_only=True)
+
+        # clean & momotonic
+        med = med.replace([np.inf, -np.inf], np.nan).interpolate(limit_direction="both")
+        med = pd.Series(np.maximum.accumulate(med.values), index=med.index)
+
+        # force D0 = 100 if present
+        if "roas_d0" in [c.lower() for c in med.index]:
+        # exact name in med.index may differ in case; fix:
+            for name in med.index:
+                if str(name).lower() == "roas_d0":
+                    med.loc[name] = 1.0
+                    break
+        return med
+
+        # Build multiplier curve depending on source
+        mult_curve = None
         if baseline_source.startswith("Selected"):
+            # selected campaigns only (within chosen game+network already)
             rows = []
             for cname in selected_campaigns:
-                cdf = app_df[app_df["campaign_network"] == cname]
-                if not cdf.empty:
-                    rows.append(cdf[roas_columns_filtered].mean(numeric_only=True))
-            if rows:
-                avg = pd.concat(rows, axis=1).mean(axis=1)
-                baseline_series = avg
+                 cdf = app_df[app_df["campaign_network"] == cname]
+                 if not cdf.empty:
+                     rows.append(cdf)
+            block = pd.concat(rows) if rows else pd.DataFrame()
+            mult_curve = _median_multiplier_curve(block, roas_columns_filtered)
         else:
+            # network-level median multipliers (this game + selected network)
             net_df = app_df[app_df["channel"] == selected_network]
-            if not net_df.empty:
-                baseline_series = net_df[roas_columns_filtered].median(numeric_only=True)
-
-        if baseline_series is None or baseline_series.empty:
-            st.info("Not enough data to build a baseline growth curve for projection.")
-        else:
-            curve = _growth_curve(baseline_series)
-            if curve.empty:
-                st.info("Baseline curve could not be computed (D0 missing or zero).")
-            else:
-                # Adjust targets as per your data (Adjust often has up to D50)
-                target_days = [30, 45, 50, 60, 75]
-                proj = _project_from_d0(proj_d0, curve, target_days)
-
-                st.write("**Projected ROAS (given your D0 and historical growth):**")
-                cols_proj = st.columns(len(target_days))
-                for i, d in enumerate(target_days):
-                    with cols_proj[i]:
-                        val = proj.get(d, np.nan)
-                        st.metric(f"D{d}", f"{val*100:.2f}%" if np.isfinite(val) else "—")
-
-                st.dataframe(
-                    pd.DataFrame({"Day": [f"D{d}" for d in target_days],
-                                  "Projected ROAS": [proj.get(d, np.nan) for d in target_days]})
-                      .set_index("Day")
-                      .style.format({"Projected ROAS": lambda x: f"{x*100:.2f}%" if pd.notna(x) else "—"}),
-                    use_container_width=True
-                )
+            mult_curve = _median_multiplier_curve(net_df, roas_columns_filtered)
+        # Debug expander (optional)
         with st.expander("Debug: projection inputs", expanded=False):
             st.write("Detected ROAS columns:", roas_columns_filtered)
-            if baseline_series is not None and not baseline_series.empty:
-                st.write("Baseline series (raw averages/median):")
-                st.dataframe(baseline_series.to_frame("value").style.format("{:.4f}"))
-                st.write("Growth multipliers vs D0:")
-                st.dataframe(_growth_curve(baseline_series).to_frame("mult").style.format("{:.4f}"))
+            if mult_curve is None or mult_curve.empty:
+                st.write("Multiplier curve: EMPTY")
             else:
-                st.write("No baseline series (empty).")
+                st.write("Multiplier curve (median per day):")
+                st.dataframe(mult_curve.to_frame("mult").style.format("{:.4f}"))
+        # Guard: degenerate/flat curve    
+        if mult_curve is None or mult_curve.empty or mult_curve.nunique(dropna=True) <= 1:
+            st.warning("Baseline curve is flat/insufficient (only D0 or identical values). Projections would be constant, so skipped. Please check CSV or try the other baseline.")
+        else:
+            # Targets you want to show (add 75 since you now have it)
+            target_days = [30, 45, 50, 60, 75]
+            # Reuse project helper but pass the multiplier curve as if it were ROAS,
+            # because _project_from_d0 expects a 'curve' with roas_d* labels.
+            # We'll just multiply at the end: proj = d0 * multiplier(day)
+            proj = {}
+            # Build a "fake" series with roas_d* labels from mult_curve
+            # (in case index objects differ)
+            curve_like = pd.Series(mult_curve.values, index=[str(i) for i in mult_curve.index])
+            curve_like.index = mult_curve.index # keep original labels (roas_dX)
+            # Use the helper to get multipliers at target days
+            mult_at_targets = _project_from_d0(1.0, curve_like, target_days)  # 1.0 so it returns multipliers
+            # Now scale by user D0
+            for d in target_days:
+                if d in mult_at_targets and np.isfinite(mult_at_targets[d]):
+                    proj[d] = mult_at_targets[d] * proj_d0
+                else:
+                    proj[d] = np.nan
+            st.write("**Projected ROAS (given your D0 and historical growth):**")
+            cols_proj = st.columns(len(target_days))
+            for i, d in enumerate(target_days):
+                with cols_proj[i]:
+                    val = proj.get(d, np.nan)
+                    st.metric(f"D{d}", f"{val*100:.2f}%" if np.isfinite(val) else "—")
+
+            st.dataframe(
+                pd.DataFrame({"Day": [f"D{d}" for d in target_days],
+                      "Projected ROAS": [proj.get(d, np.nan) for d in target_days]})
+                .set_index("Day")
+                .style.format({"Projected ROAS": lambda x: f"{x*100:.2f}%" if pd.notna(x) else "—"}),
+                use_container_width=True
+            )
         # ======== /Quick Projection from D0 ========
 
         if selected_campaigns:
@@ -718,5 +764,6 @@ else:
                     st.warning("D0 ROAS is zero/NaN — cannot compute scenario growth.")
         else:
             st.info("Please select one or more campaigns to analyze.")
+
 
 
