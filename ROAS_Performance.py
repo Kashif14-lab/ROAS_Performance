@@ -15,36 +15,25 @@ from matplotlib.ticker import PercentFormatter
 st.set_page_config(layout="wide")
 st.markdown("""
 <style>
+/* Slightly bolder tabs */
 .stTabs [data-testid="stTab"] button { font-size: 1.1rem; font-weight: 700; }
+/* Tweak sidebar titles */
+section[data-testid="stSidebar"] h2, section[data-testid="stSidebar"] h3 { margin-top: 0.4rem; }
 </style>
 """, unsafe_allow_html=True)
 
 # -----------------------------
 # Utilities: per-user "sid" via URL (using st.query_params only)
 # -----------------------------
-try:
-    from streamlit_browser_storage import BrowserStorage
-    _HAS_BS = True
-except Exception:
-    _HAS_BS = False
-
 def get_or_set_sid():
-    if _HAS_BS:
-        try:
-            bs = BrowserStorage(key="roas_analyzer_user_id")
-            sid = bs.get("sid")
-            if not sid:
-                sid = str(uuid.uuid4())
-                bs.set("sid", sid)
-            return sid
-        except Exception:
-            pass  # fall through to query_params if plugin misbehaves
-
-    # Fallback: URL query param (no extra deps)
+    """
+    If ?sid is in the URL, use it. Otherwise create a new sid and set it in the URL query params.
+    Keeps the same sid across hard refresh and isolates users unless they share the sid link.
+    """
     if "sid" in st.query_params and st.query_params["sid"]:
         return st.query_params["sid"]
     sid = str(uuid.uuid4())
-    st.query_params["sid"] = sid
+    st.query_params["sid"] = sid  # updates the URL
     return sid
 
 SID = get_or_set_sid()
@@ -59,11 +48,35 @@ def _sid_cache_path(sid: str) -> str:
     return os.path.join(DATA_DIR, f"{sid}_last_upload.csv")
 
 # -----------------------------
-# Robust break-even crossing
+# Helpers
 # -----------------------------
+def _parse_roas_series(x):
+    if pd.isna(x): return np.nan
+    s = str(x).replace('%','').replace(',','').strip()
+    return pd.to_numeric(s, errors='coerce')/100.0
+
+def parse_app_fields(app_str):
+    """
+    Expect names like: PS_IOS_Game_Name or PS_Android_Game_Name
+    Returns Series: app_platform ('iOS'/'Android'/raw) and app_game (string after second underscore)
+    """
+    s = str(app_str) if pd.notna(app_str) else ""
+    parts = s.split("_")
+    platform, game = "Unknown", s
+    if len(parts) >= 3:
+        plat_raw = parts[1].lower()
+        if "ios" in plat_raw:
+            platform = "iOS"
+        elif "and" in plat_raw or "android" in plat_raw:
+            platform = "Android"
+        else:
+            platform = parts[1]
+        game = "_".join(parts[2:])
+    return pd.Series({"app_platform": platform, "app_game": game})
+
 def predict_cross_day(days, values, target=1.0):
     """
-    Predict break-even day robustly:
+    Robust break-even crossing:
       1) Interpolate missing values
       2) Enforce non-decreasing series
       3) Linear interpolation for the crossing point
@@ -92,36 +105,53 @@ def predict_cross_day(days, values, target=1.0):
         return x2
     return x1 + (target - y1) * (x2 - x1) / (y2 - y1)
 
-# -----------------------------
-# App string parser
-# -----------------------------
-def parse_app_fields(app_str):
+def _growth_curve(series: pd.Series) -> pd.Series:
+    """ROAS growth multipliers vs D0: g[x] = roas_dx / roas_d0. Cleans + monotonic."""
+    s = series.copy().astype(float)
+    if "roas_d0" not in s.index or pd.isna(s["roas_d0"]) or s["roas_d0"] <= 0:
+        return pd.Series(dtype=float)
+    s = s.replace([np.inf, -np.inf], np.nan).interpolate(limit_direction="both")
+    s.loc[:] = np.maximum.accumulate(s.values)
+    return s / s["roas_d0"]
+
+def _project_from_d0(d0_value: float, curve: pd.Series, target_days: list[int]) -> dict[int, float]:
     """
-    Expected patterns like: PS_IOS_Game_Name or PS_Android_Game_Name
-    Returns Series: app_platform ('iOS'/'Android'/raw) and app_game (string after second underscore)
+    d0_value decimal (e.g., 0.18). curve index: roas_d0, roas_d3, ... values are multipliers vs D0.
+    Interpolates/extrapolates as needed.
     """
-    s = str(app_str) if pd.notna(app_str) else ""
-    parts = s.split("_")
-    platform, game = "Unknown", s
-    if len(parts) >= 3:
-        plat_raw = parts[1].lower()
-        if "ios" in plat_raw:
-            platform = "iOS"
-        elif "and" in plat_raw or "android" in plat_raw:
-            platform = "Android"
+    known = []
+    for col, val in curve.items():
+        if str(col).lower().startswith("roas_d"):
+            d = str(col).lower().replace("roas_d","")
+            if d.isdigit():
+                known.append((int(d), float(val)))
+    if not known:
+        return {}
+    known.sort(key=lambda t: t[0])
+    xs = np.array([d for d,_ in known], dtype=float)
+    ys = np.array([v for _,v in known], dtype=float)
+    out = {}
+    for td in target_days:
+        if td <= xs.min():
+            mult = ys[xs.argmin()]
+        elif td >= xs.max():
+            if len(xs) >= 2:
+                x1,x2 = xs[-2], xs[-1]; y1,y2 = ys[-2], ys[-1]
+                slope = (y2 - y1) / (x2 - x1) if x2 != x1 else 0.0
+                mult = y2 + (td - x2) * slope
+            else:
+                mult = ys[-1]
         else:
-            platform = parts[1]
-        game = "_".join(parts[2:])
-    return pd.Series({"app_platform": platform, "app_game": game})
+            mult = float(np.interp(td, xs, ys))
+        out[td] = max(mult, 0.0) * d0_value
+    return out
+
+def _is_num(x):
+    return x is not None and isinstance(x, (int, float, np.floating)) and np.isfinite(x)
 
 # -----------------------------
 # Data loading / preprocess
 # -----------------------------
-def _parse_roas_series(x):
-    if pd.isna(x): return np.nan
-    s = str(x).replace('%','').replace(',','').strip()
-    return pd.to_numeric(s, errors='coerce')/100.0
-
 @st.cache_data
 def load_data_from_path_or_file(path_or_file):
     if isinstance(path_or_file, str):
@@ -196,7 +226,7 @@ if st.session_state.df is None and os.path.exists(_sid_cache_path(SID)):
 # -----------------------------
 if not st.session_state.show_analysis_page:
     st.title("Campaign Performance Analyzer (ROAS)")
-    st.write("Upload an Adjust CSV to analyze ROAS simply and persist.")
+    st.write("Upload an Adjust CSV to analyze ROAS simply and persist it to your private session.")
 
     st.markdown("---")
     report_link = "https://suite.adjust.com/datascape/report?utc_offset=%2B00%3A00&reattributed=all&attribution_source=first&attribution_type=all&ad_spend_mode=network&date_period=-92d%3A-1d&cohort_maturity=mature&sandbox=false&channel_id__in=%22partner_257%22%2C%22partner_7%22%2C%22partner_34%22%2C%22partner_182%22%2C%22partner_100%22%2C%22partner_369%22%2C%22partner_56%22%2C%22partner_490%22%2C%22partner_2337%2C1678%22%2C%22partner_217%22&applovin_mode=probabilistic&ironsource_mode=ironsource&dimensions=app%2Cchannel%2Ccampaign_network&format_dates=false&full_data=true&include_attr_dependency=true&metrics=cost%2Cinstalls%2Cgross_profit%2Croas_d0%2Croas_d3%2Croas_d7%2Croas_d14%2Croas_d21%2Croas_d28%2Croas_d30%2Croas_d45%2Croas_d50&readable_names=false&sort=-cost&parent_report_id=213219&cost__gt__column=0&is_report_setup_open=true&table_view=pivot"
@@ -355,6 +385,7 @@ else:
     # Tabs
     tab1, tab2 = st.tabs(["Standard Analysis", "Scenario Analysis"])
 
+    # ----------------------- TAB 1 -----------------------
     with tab1:
         st.subheader("Standard Break-Even Analysis")
         st.write("Two modes: (1) Required D0 to break even by a specific day, (2) Predicted day to reach a target ROAS.")
@@ -384,8 +415,66 @@ else:
 
         st.markdown("---")
 
+        # ======== Quick Projection from D0 (NEW) ========
+        st.markdown("### Quick Projection from D0 (by historical growth)")
+
+        proj_d0_pct = st.number_input(
+            "Enter hypothetical/observed D0 ROAS (%)",
+            min_value=0.0, max_value=500.0, value=20.0, step=1.0
+        )
+        proj_d0 = proj_d0_pct / 100.0
+
+        baseline_source = st.radio(
+            "Baseline growth curve:",
+            ("Selected campaign (avg of selected)", "Network-level median (this game + network)"),
+            horizontal=True
+        )
+
+        baseline_series = None
+        if baseline_source.startswith("Selected"):
+            rows = []
+            for cname in selected_campaigns:
+                cdf = app_df[app_df["campaign_network"] == cname]
+                if not cdf.empty:
+                    rows.append(cdf[roas_columns_filtered].mean(numeric_only=True))
+            if rows:
+                avg = pd.concat(rows, axis=1).mean(axis=1)
+                baseline_series = avg
+        else:
+            net_df = app_df[app_df["channel"] == selected_network]
+            if not net_df.empty:
+                baseline_series = net_df[roas_columns_filtered].median(numeric_only=True)
+
+        if baseline_series is None or baseline_series.empty:
+            st.info("Not enough data to build a baseline growth curve for projection.")
+        else:
+            curve = _growth_curve(baseline_series)
+            if curve.empty:
+                st.info("Baseline curve could not be computed (D0 missing or zero).")
+            else:
+                # Adjust targets as per your data (Adjust often has up to D50)
+                target_days = [30, 45, 50, 60]
+                proj = _project_from_d0(proj_d0, curve, target_days)
+
+                st.write("**Projected ROAS (given your D0 and historical growth):**")
+                cols_proj = st.columns(len(target_days))
+                for i, d in enumerate(target_days):
+                    with cols_proj[i]:
+                        val = proj.get(d, np.nan)
+                        st.metric(f"D{d}", f"{val*100:.2f}%" if np.isfinite(val) else "—")
+
+                st.dataframe(
+                    pd.DataFrame({"Day": [f"D{d}" for d in target_days],
+                                  "Projected ROAS": [proj.get(d, np.nan) for d in target_days]})
+                      .set_index("Day")
+                      .style.format({"Projected ROAS": lambda x: f"{x*100:.2f}%" if pd.notna(x) else "—"}),
+                    use_container_width=True
+                )
+        # ======== /Quick Projection from D0 ========
+
         if selected_campaigns:
             # 1) Actual ROAS Values
+            st.markdown("---")
             st.markdown("### 1) Actual ROAS Values")
             actual_rows = []
             for cname in selected_campaigns:
@@ -490,9 +579,8 @@ else:
                                 st.info(f"D{break_even_day} ROAS column missing or NaN.")
 
                         else:
-                            target_roas = target_roas  # already defined above in this branch
                             be_day = predict_cross_day(days, vals, target=target_roas)
-                            if be_day is not None and be_day <= max(days):
+                            if _is_num(be_day) and be_day <= max(days):
                                 st.success(f"Predicted to reach **{target_roas*100:.0f}% ROAS** around **Day {be_day:.1f}**.")
                             else:
                                 st.error(f"Not predicted to reach **{target_roas*100:.0f}% ROAS** within Day {max(days)}.")
@@ -517,7 +605,7 @@ else:
                             ax.axhline(y=1.0, linestyle='-', label='Break-Even (100%)')
                             if analysis_mode == "Predicted Day for a Target ROAS":
                                 ax.axhline(y=target_roas, linestyle='--', label=f"Target ({target_roas*100:.0f}%)")
-                                if be_day is not None and be_day <= max(days):
+                                if _is_num(be_day) and be_day <= max(days):
                                     ax.axvline(x=be_day, linestyle=':', label=f"Predicted ~{be_day:.1f}")
                             ax.set_title(f'ROAS Performance — {cname}')
                             ax.set_xlabel('Days After Installation'); ax.set_ylabel('Average ROAS')
@@ -530,6 +618,7 @@ else:
         else:
             st.info("Please select one or more campaigns to analyze.")
 
+    # ----------------------- TAB 2 -----------------------
     with tab2:
         st.subheader("Break-Even Scenario Analysis")
         st.write("Project break-even day using optimistic and pessimistic multipliers.")
@@ -574,22 +663,20 @@ else:
                         st.write("**Predicted Break-Even Days:**")
                         k1, k2, k3 = st.columns(3)
                         with k1:
-                            if opt_be is not None:
+                            if _is_num(opt_be):
                                 st.success(f"Optimistic: Day {opt_be:.1f}")
                             else:
                                 st.error("Optimistic: Not within timeframe")
-
-                        with k1:
-                            if base_be is not None:
+                        with k2:
+                            if _is_num(base_be):
                                 st.info(f"Base: Day {base_be:.1f}")
                             else:
                                 st.error("Base: Not within timeframe")
-
                         with k3:
-                            if pes_be is not None:
+                            if _is_num(pes_be):
                                 st.warning(f"Pessimistic: Day {pes_be:.1f}")
                             else:
-                                st.warning(f"Pessimistic: Day {pes_be:.1f}")
+                                st.error("Pessimistic: Not within timeframe")
 
                         show_chart = st.checkbox(
                             f"Show Scenario Chart for {cname}",
@@ -608,9 +695,9 @@ else:
                             ax.plot(xs, ys_pes, marker='o', linestyle='--', label=f'Pessimistic (-{pessimistic_growth_percent}%)')
                             ax.axhline(y=1.0, linestyle='-', label='Break-Even (100%)')
 
-                            if opt_be is not None: ax.axvline(x=opt_be, linestyle=':', label=f'Opt. ~{opt_be:.1f}')
-                            if base_be is not None: ax.axvline(x=base_be, linestyle=':', label=f'Base ~{base_be:.1f}')
-                            if pes_be is not None: ax.axvline(x=pes_be, linestyle=':', label=f'Pess. ~{pes_be:.1f}')
+                            if _is_num(opt_be):  ax.axvline(x=opt_be,  linestyle=':', label=f'Opt. ~{opt_be:.1f}')
+                            if _is_num(base_be): ax.axvline(x=base_be, linestyle=':', label=f'Base ~{base_be:.1f}')
+                            if _is_num(pes_be):  ax.axvline(x=pes_be,  linestyle=':', label=f'Pess. ~{pes_be:.1f}')
 
                             ax.set_title(f'Break-Even Scenarios — {cname}')
                             ax.set_xlabel('Days After Installation'); ax.set_ylabel('Average ROAS')
@@ -622,8 +709,3 @@ else:
                     st.warning("D0 ROAS is zero/NaN — cannot compute scenario growth.")
         else:
             st.info("Please select one or more campaigns to analyze.")
-
-
-
-
-
