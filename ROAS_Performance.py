@@ -574,11 +574,22 @@ else:
                         st.write("**Predicted Break-Even Days:**")
                         k1, k2, k3 = st.columns(3)
                         with k1:
-                            st.success(f"Optimistic: Day `{opt_be:.1f}`") if opt_be is not None else st.error("Optimistic: Not within timeframe")
-                        with k2:
-                            st.info(f"Base: Day `{base_be:.1f}`") if base_be is not None else st.error("Base: Not within timeframe")
+                            if opt_be is not None:
+                                st.success(f"Optimistic: Day {opt_be:.1f}")
+                            else:
+                                st.error("Optimistic: Not within timeframe")
+
+                        with k1:
+                            if base_be is not None:
+                                st.info(f"Base: Day {base_be:.1f}")
+                            else:
+                                st.error("Base: Not within timeframe")
+
                         with k3:
-                            st.warning(f"Pessimistic: Day `{pes_be:.1f}`") if pes_be is not None else st.error("Pessimistic: Not within timeframe")
+                            if pes_be is not None:
+                                st.warning(f"Pessimistic: Day {pes_be:.1f}")
+                            else:
+                                st.warning(f"Pessimistic: Day {pes_be:.1f}")
 
                         show_chart = st.checkbox(
                             f"Show Scenario Chart for {cname}",
@@ -611,6 +622,7 @@ else:
                     st.warning("D0 ROAS is zero/NaN — cannot compute scenario growth.")
         else:
             st.info("Please select one or more campaigns to analyze.")
+
 
 
 
