@@ -126,6 +126,21 @@ def _interp_extrap_from_curve(mult_curve: pd.Series, target_day: int) -> float:
             return ys[-1]
     return float(np.interp(target_day, xs, ys))
 
+def detect_week_col(df: pd.DataFrame):
+    # normalize column labels
+    labels = {str(c).strip(): c for c in df.columns}
+    lowmap = {k.lower(): v for k, v in labels.items()}
+    # common aliases
+    for key in ("week_start", "week", "week_start_date", "weekstart", "cohort_week", "cohort_start"):
+        if key in lowmap:
+            return lowmap[key]
+    # fallback: koi bhi column jo "week" se start hota ho
+    for k, v in labels.items():
+        if k.lower().startswith("week"):
+            return v
+    return None
+
+
 # ----- Pooled robust median multipliers (fallback / non-weekly) -----
 def pooled_multiplier_curve(df_block: pd.DataFrame, roas_cols: list[str],
                             min_rows: int = 3, tiny_delta: float = 1e-3,
@@ -324,12 +339,12 @@ def load_data_from_path_or_file(path_or_file):
     roas_days = sorted(set(roas_days))
 
     # weekly parse if present
-    wk_candidates = [c for c in df.columns if c.lower()=="week"]
-    if wk_candidates:
-        wcol = wk_candidates[0]
+    wcol = detect_week_col(df)
+    if wcol:
         try:
             df[wcol] = pd.to_datetime(df[wcol], errors="coerce").dt.date
         except Exception:
+            # agar yeh date nahi hai (jaise "2025-W35"), to as-is rehne dein
             pass
 
     return df, roas_columns, roas_days
@@ -906,3 +921,4 @@ else:
                 )
         else:
             st.info("Select one or more campaigns to view weekly breakdown.")
+
