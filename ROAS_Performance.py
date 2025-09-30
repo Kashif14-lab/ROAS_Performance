@@ -34,6 +34,21 @@ def _sid_cache_path(sid: str) -> str:
     return os.path.join(DATA_DIR, f"{sid}_last_upload.csv")
 
 # =============== Helpers ===============
+def detect_spend_col(df: pd.DataFrame) -> str | None:
+    # common names preference order
+    candidates = ["cost", "spend", "ad_spend", "adspend", "media_cost"]
+    lower = {c.lower(): c for c in df.columns}
+    for c in candidates:
+        if c in lower:
+            return lower[c]
+    # fallback: koi bhi column jisme 'cost' ya 'spend' word aa raha ho
+    for col in df.columns:
+        cl = str(col).lower()
+        if "cost" in cl or "spend" in cl:
+            return col
+    return None
+
+
 def _parse_roas_series(x):
     if pd.isna(x): return np.nan
     s = str(x).replace('%','').replace(',','').strip()
@@ -126,21 +141,6 @@ def _interp_extrap_from_curve(mult_curve: pd.Series, target_day: int) -> float:
             return ys[-1]
     return float(np.interp(target_day, xs, ys))
 
-def detect_week_col(df: pd.DataFrame):
-    # normalize column labels
-    labels = {str(c).strip(): c for c in df.columns}
-    lowmap = {k.lower(): v for k, v in labels.items()}
-    # common aliases
-    for key in ("week_start", "week", "week_start_date", "weekstart", "cohort_week", "cohort_start"):
-        if key in lowmap:
-            return lowmap[key]
-    # fallback: koi bhi column jo "week" se start hota ho
-    for k, v in labels.items():
-        if k.lower().startswith("week"):
-            return v
-    return None
-
-
 # ----- Pooled robust median multipliers (fallback / non-weekly) -----
 def pooled_multiplier_curve(df_block: pd.DataFrame, roas_cols: list[str],
                             min_rows: int = 3, tiny_delta: float = 1e-3,
@@ -197,6 +197,131 @@ def pooled_multiplier_curve(df_block: pd.DataFrame, roas_cols: list[str],
     if "roas_d0" in cleaned.index: cleaned.loc["roas_d0"]=1.0
     return cleaned
 
+def _iqr_filter(series: pd.Series):
+    """Return mask True=keep, False=outlier for a 1D series (NaNs ignored)."""
+    x = series.dropna()
+    if len(x) < 5:
+        return series.notna()  # not enough points: keep all non-nan
+    q1, q3 = np.percentile(x, [25, 75])
+    iqr = q3 - q1
+    lo, hi = q1 - 1.5*iqr, q3 + 1.5*iqr
+    return series.between(lo, hi)
+
+def _ewma(series: pd.Series, half_life_weeks: float):
+    """Exponentially weighted moving average over weekly D0 values."""
+    s = series.dropna()
+    if s.empty:
+        return np.nan
+    if half_life_weeks <= 0:
+        return s.iloc[-1]  # no smoothing → last value
+    alpha = 1 - np.exp(-np.log(2)/half_life_weeks)
+    out = s.iloc[0]
+    for v in s.iloc[1:]:
+        out = alpha * v + (1 - alpha) * out
+    return float(out)
+
+def _linear_trend_forecast(series: pd.Series, steps_ahead: int = 1):
+    """
+    Simple robust-ish trend on weekly index.
+    series index should be sortable (dates). Returns next-step forecast.
+    """
+    s = series.dropna()
+    if len(s) < 3:
+        return s.iloc[-1] if len(s) else np.nan
+    # convert index to 0..n-1
+    x = np.arange(len(s), dtype=float)
+    y = s.values.astype(float)
+    # ordinary least squares
+    A = np.vstack([x, np.ones_like(x)]).T
+    try:
+        m, b = np.linalg.lstsq(A, y, rcond=None)[0]
+        return float(m * (len(s) - 1 + steps_ahead) + b)
+    except Exception:
+        return float(s.iloc[-1])
+
+def predict_weekly_d0(df_scope: pd.DataFrame,
+                      wcol: str,
+                      roas_cols: list[str],
+                      weeks_selected: list,
+                      exclude_incomplete: bool = True,
+                      half_life_weeks: float = 6,
+                      weight_by_col: str | None = None):
+    """
+    df_scope: already filtered to game (+network or selected campaigns)
+    Returns (d0_pred, debug_df)
+    """
+    if df_scope is None or df_scope.empty or not wcol:
+        return np.nan, pd.DataFrame()
+
+    d0col = next((c for c in roas_cols if str(c).lower() == "roas_d0"), None)
+    if d0col is None:
+        return np.nan, pd.DataFrame()
+
+    # choose weeks set
+    weeks_all = sorted(df_scope[wcol].dropna().unique().tolist())
+    if not weeks_all:
+        return np.nan, pd.DataFrame()
+    weeks_use = list(weeks_selected) if weeks_selected else weeks_all
+
+    # aggregate D0 per week
+    agg = df_scope[df_scope[wcol].isin(weeks_use)].groupby(wcol)[[d0col]].mean(numeric_only=True)
+    agg.rename(columns={d0col: "d0"}, inplace=True)
+
+    # weights (optional): cost/installs sum per week
+    if weight_by_col and weight_by_col in df_scope.columns:
+        w = df_scope[df_scope[wcol].isin(weeks_use)].groupby(wcol)[weight_by_col].sum(min_count=1)
+        agg["base_weight"] = w
+    else:
+        agg["base_weight"] = 1.0
+
+    # outlier filter on weekly D0
+    keep_mask = _iqr_filter(agg["d0"])
+    agg["keep"] = keep_mask
+    agg.loc[~keep_mask, "base_weight"] = 0.0  # drop outliers by zeroing weight
+
+    # freshness decay
+    if len(agg.index) >= 1:
+        latest = max(agg.index)
+        def _age_weeks(w):
+            if isinstance(latest, (pd.Timestamp, date)) and isinstance(w, (pd.Timestamp, date)):
+                return (latest - w).days / 7.0
+            return 0.0
+        agg["age_weeks"] = [ _age_weeks(w) for w in agg.index ]
+    else:
+        agg["age_weeks"] = 0.0
+
+    if half_life_weeks and half_life_weeks > 0:
+        lam = np.log(2) / half_life_weeks
+        agg["decay"] = np.exp(-lam * agg["age_weeks"])
+    else:
+        agg["decay"] = 1.0
+
+    agg["eff_weight"] = agg["base_weight"].fillna(0).astype(float) * agg["decay"].astype(float)
+
+    # 3 signals → combine:
+    #   (a) EWMA of D0 (freshness-aware)
+    d0_ewma = _ewma(agg["d0"], half_life_weeks=half_life_weeks)
+    #   (b) Weighted average (by eff_weight)
+    if agg["eff_weight"].sum() > 0:
+        d0_wavg = float(np.nansum(agg["d0"] * agg["eff_weight"]) / np.nansum(agg["eff_weight"]))
+    else:
+        d0_wavg = float(agg["d0"].dropna().iloc[-1]) if agg["d0"].notna().any() else np.nan
+    #   (c) Linear trend one step ahead (next week)
+    d0_trend = _linear_trend_forecast(agg["d0"].sort_index(), steps_ahead=1)
+
+    # Blend (weights tuned simply; you can expose sliders later)
+    # More stable: 50% ewma, 30% weighted avg, 20% trend
+    parts = [0.5*d0_ewma, 0.3*d0_wavg, 0.2*d0_trend]
+    d0_pred = float(np.nanmean(parts))
+
+    dbg = agg.reset_index().rename(columns={wcol: "week"})
+    dbg["d0_ewma"]  = d0_ewma
+    dbg["d0_wavg"]  = d0_wavg
+    dbg["d0_trend"] = d0_trend
+    dbg["d0_pred"]  = d0_pred
+    return d0_pred, dbg
+
+
 # ----- Weighted median helper -----
 def weighted_median(values: np.ndarray, weights: np.ndarray) -> float:
     mask = np.isfinite(values) & np.isfinite(weights) & (weights>0)
@@ -228,7 +353,7 @@ def weekly_multiplier_curve(df_block: pd.DataFrame, roas_cols: list[str],
     d0col = col_map["roas_d0"]
 
     # choose weight column
-    SPEND_COL = "cost"  # rename if your sheet uses "spend"
+    SPEND_COL = detect_spend_col(app_df)  # rename if your sheet uses "spend"
     weight_col = None
     if weight_by.lower().startswith("inst") and "installs" in df_block.columns:
         weight_col = "installs"
@@ -339,12 +464,12 @@ def load_data_from_path_or_file(path_or_file):
     roas_days = sorted(set(roas_days))
 
     # weekly parse if present
-    wcol = detect_week_col(df)
-    if wcol:
+    wk_candidates = [c for c in df.columns if c.lower()=="week"]
+    if wk_candidates:
+        wcol = wk_candidates[0]
         try:
             df[wcol] = pd.to_datetime(df[wcol], errors="coerce").dt.date
         except Exception:
-            # agar yeh date nahi hai (jaise "2025-W35"), to as-is rehne dein
             pass
 
     return df, roas_columns, roas_days
@@ -454,18 +579,31 @@ else:
         st.warning("Too many days excluded — need at least D0 and one more day."); st.stop()
 
     # Campaigns sorted by spend (use view_df later after weekly toggle)
-    chan_df_base = app_df[app_df["channel"] == selected_network]
-    SPEND_COL = "cost"  # change if your sheet uses a different spend column
-    try:
-        spend_by_campaign = (
-            chan_df_base.groupby("campaign_network", dropna=False)[SPEND_COL]
-                  .sum(min_count=1).fillna(0).sort_values(ascending=False)
+    chan_df_overall = app_df[app_df["channel"] == selected_network].copy()
+    # Auto-detect spend column once (cost/spend/ad_spend…)
+    SPEND_COL = detect_spend_col(app_df)
+    if SPEND_COL and SPEND_COL in chan_df_overall.columns:
+        spend_by_campaign_overall = (
+            chan_df_overall.groupby("campaign_network", dropna=False)[SPEND_COL]
+            .sum(min_count=1)
+            .fillna(0)
+            .sort_values(ascending=False)
         )
-        all_campaigns_in_network = list(spend_by_campaign.index)
-    except KeyError:
-        all_campaigns_in_network = sorted(chan_df_base["campaign_network"].dropna().unique().tolist())
+        all_campaigns_in_network = list(spend_by_campaign_overall.index)
+    else:
+        # Fallback: alphabetical
+        all_campaigns_in_network = sorted(
+            chan_df_overall["campaign_network"].dropna().unique().tolist()
+        )
     default_list = all_campaigns_in_network[:5]
-    selected_campaigns = st.multiselect("Select Campaigns:", all_campaigns_in_network, default=default_list)
+    # NOTE: options ki order hi UI order hoti hai → yahan hi sort apply ho gaya.
+    selected_campaigns = st.multiselect(
+        "Select Campaigns:",
+        options=all_campaigns_in_network,
+        default=default_list,
+        key="campaign_picklist"
+    )
+
 
     # ========== Weekly controls (drive view + projections) ==========
     has_weekly = "week" in [c.lower() for c in app_df.columns]
@@ -537,20 +675,64 @@ else:
         st.markdown("### Quick Projection from D0")
 
         # D0 input (auto from last selected week if weekly exists)
-        if has_weekly and weeks_selected:
-            last_sel_week = max(weeks_selected)
-            d0col = next((c for c in roas_columns_filtered if str(c).lower()=="roas_d0"), None)
-            if d0col is not None:
-                d0_last_week = app_df[(app_df[wcol]==last_sel_week) & (app_df["channel"]==selected_network)][d0col].mean()
-                if pd.notna(d0_last_week):
-                    proj_d0 = d0_last_week
-                    st.info(f"Auto-filled D0 from last selected week ({last_sel_week}): **{proj_d0*100:.2f}%**")
-                else:
-                    proj_d0 = st.number_input("Enter D0 ROAS (%)", 0.0, 500.0, 20.0) / 100.0
+        d0_source = st.radio(
+            "D0 source for projection",
+            ("Manual", "Auto (Network weekly trend)", "Auto (Selected campaigns weekly trend)"),
+            horizontal=True
+            )
+        
+        # ===== D0 selection / prediction =====
+        # roas_columns_filtered already available
+        d0col = next((c for c in roas_columns_filtered if str(c).lower()=="roas_d0"), None)
+        # default manual value (used if Manual selected or fallback)
+        manual_d0 = st.number_input("Enter D0 ROAS (%)", 0.0, 500.0, 20.0) / 100.0
+        proj_d0 = manual_d0  # initialize
+        
+        if d0_source != "Manual":
+            if not has_weekly:
+                st.warning("Weekly column not found — cannot auto-predict D0. Using Manual.")
             else:
-                proj_d0 = st.number_input("Enter D0 ROAS (%)", 0.0, 500.0, 20.0) / 100.0
-        else:
-            proj_d0 = st.number_input("Enter D0 ROAS (%)", 0.0, 500.0, 20.0) / 100.0
+                # scope selection
+                if d0_source.startswith("Auto (Network"):
+                    scope_df = app_df[app_df["channel"] == selected_network]
+                else:
+                    # selected campaigns scope
+                    scope_df = view_df[view_df["campaign_network"].isin(selected_campaigns)]
+                    # agar weekly tables toggle off hai aur view_df = app_df ho sakta, ensure scope per network too if needed:
+                    if scope_df.empty and len(selected_campaigns) > 0:
+                        scope_df = app_df[app_df["campaign_network"].isin(selected_campaigns)]
+            # choose weight col
+            weight_by_col = None
+            if 'wk_weight_by' in st.session_state:
+                if st.session_state['wk_weight_by'].lower().startswith("inst") and "installs" in scope_df.columns:
+                    weight_by_col = "installs"
+            if weight_by_col is None:
+                # fallback to spend/cost if exists
+                if SPEND_COL in scope_df.columns: weight_by_col = SPEND_COL
+                elif "installs" in scope_df.columns: weight_by_col = "installs"
+            # run predictor
+            d0_pred, d0_dbg = predict_weekly_d0(
+                df_scope=scope_df,
+                wcol=wcol,
+                roas_cols=roas_columns_filtered,
+                weeks_selected=weeks_selected,
+                exclude_incomplete=True,                 # optional toggle later
+                half_life_weeks=float(st.session_state.get("wk_halflife", 6)),
+                weight_by_col=weight_by_col
+            )
+            if np.isfinite(d0_pred):
+                proj_d0 = d0_pred
+                st.info(f"Predicted D0 (based on weekly trend): **{proj_d0*100:.2f}%**")
+            else:
+                st.warning("Could not compute auto D0 — using Manual.")
+            with st.expander("Debug: D0 predictor", expanded=False):
+                if not d0_dbg.empty:
+                    st.dataframe(d0_dbg, use_container_width=True)
+                st.write("Manual fallback:", f"{manual_d0*100:.2f}%")
+
+
+
+        
 
         # Baseline choice
         baseline_label = "Baseline growth curve:"
@@ -921,4 +1103,3 @@ else:
                 )
         else:
             st.info("Select one or more campaigns to view weekly breakdown.")
-
